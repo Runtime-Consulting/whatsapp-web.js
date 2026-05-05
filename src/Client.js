@@ -119,19 +119,17 @@ class Client extends EventEmitter {
         ) {
             this.options.authTimeoutMs = 30000;
         }
-        let start = Date.now();
-        let timeout = this.options.authTimeoutMs;
-        let res = false;
-        while (start > Date.now() - timeout) {
-            res = await this.pupPage.evaluate(
+        // Fix #127082: waitForFunction sobrevive a destruição de execution
+        // context durante navegação (SPA reload, login redirect, sleep/resume
+        // do Chrome). O loop manual com page.evaluate() lançava "Execution
+        // context was destroyed" no primeiro frame que reloadava — quebrava
+        // todo init. waitForFunction re-avalia em novo contexto automatic.
+        try {
+            await this.pupPage.waitForFunction(
                 'window.Debug?.VERSION != undefined',
+                { timeout: this.options.authTimeoutMs, polling: 200 }
             );
-            if (res) {
-                break;
-            }
-            await new Promise((r) => setTimeout(r, 200));
-        }
-        if (!res) {
+        } catch (_e) {
             throw 'auth timeout';
         }
         await this.setDeviceName(
@@ -326,19 +324,16 @@ class Client extends EventEmitter {
                     // Load util functions (serializers, helper functions)
                     await this.pupPage.evaluate(LoadUtils);
 
-                    let start = Date.now();
-                    let res = false;
-                    while (start > Date.now() - 30000) {
-                        // Check window.WWebJS Injection
-                        res = await this.pupPage.evaluate(
+                    // Fix #127082: mesmo motivo do loop em inject() —
+                    // waitForFunction re-avalia automaticamente quando o
+                    // execution context é destruído (navegação interna do WA
+                    // Web durante boot).
+                    try {
+                        await this.pupPage.waitForFunction(
                             'window.WWebJS != undefined',
+                            { timeout: 30000, polling: 200 }
                         );
-                        if (res) {
-                            break;
-                        }
-                        await new Promise((r) => setTimeout(r, 200));
-                    }
-                    if (!res) {
+                    } catch (_e) {
                         throw 'ready timeout';
                     }
 
@@ -490,8 +485,10 @@ class Client extends EventEmitter {
             referer: 'https://whatsapp.com/',
         });
 
-        await this.inject();
-
+        // Fix #127082: registra framenavigated ANTES do primeiro inject() pra
+        // que o recovery cubra a navegação inicial do SPA (WA Web frequentemente
+        // reloda 1x sozinho durante boot). Sem isso, qualquer nav durante o
+        // primeiro inject() lança erro sem nenhum handler de recuperação ativo.
         this.pupPage.on('framenavigated', async (frame) => {
             if (frame.url().includes('post_logout=1') || this.lastLoggedOut) {
                 this.emit(Events.DISCONNECTED, 'LOGOUT');
@@ -502,6 +499,8 @@ class Client extends EventEmitter {
             }
             await this.inject();
         });
+
+        await this.inject();
     }
 
     /**
