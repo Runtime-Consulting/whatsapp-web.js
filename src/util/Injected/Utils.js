@@ -878,32 +878,85 @@ exports.LoadUtils = () => {
             // never contacted before, fall back to a USync delta query
             // (the same sync the UI runs when opening the contact info
             // panel), which also seeds the local mapping.
+            let lidDiag = null;
             if (!chat && chatWid.server === 'c.us') {
+                lidDiag = [];
                 let lidWid = null;
                 try {
                     lidWid =
                         window
                             .require('WAWebApiContact')
                             .getCurrentLid(chatWid) || null;
-                } catch (ignoredError) {
-                    lidWid = null;
+                    lidDiag.push('cache=' + (lidWid ? 'hit' : 'miss'));
+                } catch (cacheError) {
+                    lidDiag.push(
+                        'cache_err=' + (cacheError?.message || cacheError),
+                    );
                 }
                 if (!lidWid) {
+                    let usyncQuery = null;
                     try {
-                        const usyncQuery = window
+                        usyncQuery = window
                             .require('WAWebContactSyncUtils')
                             .constructUsyncDeltaQuery([
                                 { type: 'add', phoneNumber: chatWid.user },
                             ]);
-                        const usyncResult = await usyncQuery.execute();
-                        const lid = usyncResult?.list?.[0]?.lid;
-                        if (lid) {
-                            lidWid = window
-                                .require('WAWebWidFactory')
-                                .createWid(lid);
+                        lidDiag.push('util=ok');
+                    } catch (utilError) {
+                        lidDiag.push(
+                            'util_err=' + (utilError?.message || utilError),
+                        );
+                        // WAWebContactSyncUtils may live in a lazy-loaded
+                        // chunk; build the same delta query by hand from the
+                        // core USync modules (mirrors the bundle's own
+                        // constructUsyncDeltaQuery implementation).
+                        try {
+                            const usync = window.require('WAWebUsync');
+                            const usyncUser = new (window.require(
+                                'WAWebUsyncUser',
+                            ).USyncUser)().withPhone(chatWid.user);
+                            usyncQuery = new usync.USyncQuery()
+                                .withMode('delta')
+                                .withContext('interactive')
+                                .withContactProtocol(
+                                    usync.USYNC_ADDRESSING_MODE.LID,
+                                )
+                                .withUsernameProtocol()
+                                .withUser(usyncUser);
+                            lidDiag.push('manual=ok');
+                        } catch (manualError) {
+                            lidDiag.push(
+                                'manual_err=' +
+                                    (manualError?.message || manualError),
+                            );
                         }
-                    } catch (ignoredError) {
-                        lidWid = null;
+                    }
+                    if (usyncQuery) {
+                        try {
+                            const usyncResult = await usyncQuery.execute();
+                            const lid = usyncResult?.list?.[0]?.lid;
+                            lidDiag.push(
+                                'usync=' +
+                                    (lid
+                                        ? 'lid'
+                                        : String(
+                                              JSON.stringify(
+                                                  usyncResult?.list?.[0] ??
+                                                      usyncResult ??
+                                                      null,
+                                              ),
+                                          ).slice(0, 300)),
+                            );
+                            if (lid) {
+                                lidWid = window
+                                    .require('WAWebWidFactory')
+                                    .createWid(lid);
+                            }
+                        } catch (execError) {
+                            lidDiag.push(
+                                'exec_err=' + (execError?.message || execError),
+                            );
+                        }
                     }
                 }
                 if (lidWid) {
@@ -913,20 +966,45 @@ exports.LoadUtils = () => {
                             await window
                                 .require('WAWebFindChatAction')
                                 .findOrCreateLatestChat(lidWid)
-                                .catch(() => null)
+                                .catch((findError) => {
+                                    lidDiag.push(
+                                        'lid_find_err=' +
+                                            (findError?.message || findError),
+                                    );
+                                    return null;
+                                })
                         )?.chat;
+                    lidDiag.push('lid_chat=' + (chat ? 'ok' : 'null'));
                 }
             }
 
             // Last resort keeps the original behaviour: if everything above
             // failed, let findOrCreateLatestChat throw the real error so
-            // callers see the actual reason instead of a null chat.
+            // callers see the actual reason instead of a null chat. The
+            // lidResolve breadcrumb makes each cascade step visible in the
+            // propagated error message.
             if (!chat) {
-                chat = (
-                    await window
-                        .require('WAWebFindChatAction')
-                        .findOrCreateLatestChat(chatWid)
-                )?.chat;
+                try {
+                    chat = (
+                        await window
+                            .require('WAWebFindChatAction')
+                            .findOrCreateLatestChat(chatWid)
+                    )?.chat;
+                } catch (findChatError) {
+                    if (
+                        lidDiag &&
+                        findChatError &&
+                        typeof findChatError.message === 'string'
+                    ) {
+                        try {
+                            findChatError.message +=
+                                ' [lidResolve: ' + lidDiag.join(' | ') + ']';
+                        } catch (ignoredError) {
+                            // message not writable — propagate as-is
+                        }
+                    }
+                    throw findChatError;
+                }
             }
         }
 
