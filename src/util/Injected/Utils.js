@@ -869,13 +869,65 @@ exports.LoadUtils = () => {
                 chat = null;
             }
         } else {
-            chat =
-                window.require('WAWebCollections').Chat.get(chatWid) ||
-                (
+            chat = window.require('WAWebCollections').Chat.get(chatWid);
+
+            // Since ~jul/2026 findOrCreateLatestChat throws "No LID for
+            // user" for @c.us wids of LID-migrated accounts even when the
+            // chat already exists (wwebjs #3834 / #201834). Resolve
+            // phone->LID from the local contact store first; for numbers
+            // never contacted before, fall back to a USync delta query
+            // (the same sync the UI runs when opening the contact info
+            // panel), which also seeds the local mapping.
+            if (!chat && chatWid.server === 'c.us') {
+                let lidWid = null;
+                try {
+                    lidWid =
+                        window
+                            .require('WAWebApiContact')
+                            .getCurrentLid(chatWid) || null;
+                } catch (ignoredError) {
+                    lidWid = null;
+                }
+                if (!lidWid) {
+                    try {
+                        const usyncQuery = window
+                            .require('WAWebContactSyncUtils')
+                            .constructUsyncDeltaQuery([
+                                { type: 'add', phoneNumber: chatWid.user },
+                            ]);
+                        const usyncResult = await usyncQuery.execute();
+                        const lid = usyncResult?.list?.[0]?.lid;
+                        if (lid) {
+                            lidWid = window
+                                .require('WAWebWidFactory')
+                                .createWid(lid);
+                        }
+                    } catch (ignoredError) {
+                        lidWid = null;
+                    }
+                }
+                if (lidWid) {
+                    chat =
+                        window.require('WAWebCollections').Chat.get(lidWid) ||
+                        (
+                            await window
+                                .require('WAWebFindChatAction')
+                                .findOrCreateLatestChat(lidWid)
+                                .catch(() => null)
+                        )?.chat;
+                }
+            }
+
+            // Last resort keeps the original behaviour: if everything above
+            // failed, let findOrCreateLatestChat throw the real error so
+            // callers see the actual reason instead of a null chat.
+            if (!chat) {
+                chat = (
                     await window
                         .require('WAWebFindChatAction')
                         .findOrCreateLatestChat(chatWid)
                 )?.chat;
+            }
         }
 
         return getAsModel && chat
