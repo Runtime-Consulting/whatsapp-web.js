@@ -934,16 +934,36 @@ exports.LoadUtils = () => {
                     if (usyncQuery) {
                         try {
                             const usyncResult = await usyncQuery.execute();
-                            const lid = usyncResult?.list?.[0]?.lid;
+                            const first = usyncResult?.list?.[0];
+                            // Result shape changed over time: older builds
+                            // returned the LID under `lid`, current ones
+                            // (2.3000.1043545460+) under `id` as a plain
+                            // "<number>@lid" string alongside `pn`.
+                            let lid = first?.lid || null;
+                            if (
+                                !lid &&
+                                typeof first?.id === 'string' &&
+                                first.id.endsWith('@lid')
+                            ) {
+                                lid = first.id;
+                            }
+                            if (
+                                !lid &&
+                                first?.id &&
+                                first.id.server === 'lid'
+                            ) {
+                                lid = first.id;
+                            }
+                            if (lid && typeof lid !== 'string') {
+                                lid = lid._serialized || String(lid);
+                            }
                             lidDiag.push(
                                 'usync=' +
                                     (lid
                                         ? 'lid'
                                         : String(
                                               JSON.stringify(
-                                                  usyncResult?.list?.[0] ??
-                                                      usyncResult ??
-                                                      null,
+                                                  first ?? usyncResult ?? null,
                                               ),
                                           ).slice(0, 300)),
                             );
