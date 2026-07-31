@@ -3,6 +3,13 @@
 exports.LoadUtils = () => {
     window.WWebJS = {};
 
+    // Estado da resolução phone->LID do getChat. O memo evita repetir a
+    // consulta USync a cada mensagem do mesmo contato (a Meta rate-limita:
+    // errorCode 429 "rate-overlimit" derruba a resolução inteira); o
+    // backoff para de consultar por um tempo quando o 429 acontece.
+    window.WWebJS._pnLidMemo = new Map();
+    window.WWebJS._usyncBackoffUntil = 0;
+
     /**
      * Helper function that compares between two WWeb versions. Its purpose is to help the developer to choose the correct code implementation depending on the comparison value and the WWeb version.
      * @param {string} lOperand The left operand for the WWeb version string to compare with
@@ -882,18 +889,74 @@ exports.LoadUtils = () => {
             if (!chat && chatWid.server === 'c.us') {
                 lidDiag = [];
                 let lidWid = null;
-                try {
-                    lidWid =
-                        window
-                            .require('WAWebApiContact')
-                            .getCurrentLid(chatWid) || null;
-                    lidDiag.push('cache=' + (lidWid ? 'hit' : 'miss'));
-                } catch (cacheError) {
-                    lidDiag.push(
-                        'cache_err=' + (cacheError?.message || cacheError),
-                    );
+
+                // Camada 0: memo da sessão — contato já resolvido não
+                // consulta mais nada (nem local, nem rede).
+                const memoLid = window.WWebJS._pnLidMemo.get(chatWid.user);
+                if (memoLid) {
+                    try {
+                        lidWid = window
+                            .require('WAWebWidFactory')
+                            .createWid(memoLid);
+                        lidDiag.push('memo=hit');
+                    } catch (ignoredError) {
+                        lidWid = null;
+                    }
                 }
+
                 if (!lidWid) {
+                    try {
+                        lidWid =
+                            window
+                                .require('WAWebApiContact')
+                                .getCurrentLid(chatWid) || null;
+                        lidDiag.push('cache=' + (lidWid ? 'hit' : 'miss'));
+                    } catch (cacheError) {
+                        lidDiag.push(
+                            'cache_err=' + (cacheError?.message || cacheError),
+                        );
+                    }
+                }
+
+                // Camada 2: lookup reverso LOCAL — para contato com chat
+                // existente o LID é encontrável sem rede: varre os chats
+                // @lid e mapeia de volta pro telefone via getPhoneNumber.
+                // Deixa o USync (rate-limitado pela Meta) só para o cold
+                // send genuíno.
+                if (!lidWid) {
+                    try {
+                        const allChats = window
+                            .require('WAWebCollections')
+                            .Chat.getModelsArray();
+                        for (const c of allChats) {
+                            const cid = c?.id;
+                            if (!cid) continue;
+                            const isLidChat =
+                                typeof cid.isLid === 'function'
+                                    ? cid.isLid()
+                                    : cid.server === 'lid';
+                            if (!isLidChat) continue;
+                            const pn = window
+                                .require('WAWebApiContact')
+                                .getPhoneNumber(cid);
+                            if (pn && pn.user === chatWid.user) {
+                                lidWid = cid;
+                                break;
+                            }
+                        }
+                        lidDiag.push('scan=' + (lidWid ? 'hit' : 'miss'));
+                    } catch (scanError) {
+                        lidDiag.push(
+                            'scan_err=' + (scanError?.message || scanError),
+                        );
+                    }
+                }
+
+                if (!lidWid && Date.now() < window.WWebJS._usyncBackoffUntil) {
+                    // Meta rate-limitou há pouco — falha rápido em vez de
+                    // queimar ainda mais a cota de USync.
+                    lidDiag.push('usync=backoff');
+                } else if (!lidWid) {
                     let usyncQuery = null;
                     try {
                         usyncQuery = window
@@ -934,6 +997,19 @@ exports.LoadUtils = () => {
                     if (usyncQuery) {
                         try {
                             const usyncResult = await usyncQuery.execute();
+                            const usyncErr = usyncResult?.error?.all;
+                            if (
+                                usyncErr &&
+                                (usyncErr.errorCode === 429 ||
+                                    String(usyncErr.errorText || '').includes(
+                                        'rate',
+                                    ))
+                            ) {
+                                // rate-overlimit: pausa as consultas USync por
+                                // 2 min — cada tentativa extra piora o limite
+                                window.WWebJS._usyncBackoffUntil =
+                                    Date.now() + 120000;
+                            }
                             const first = usyncResult?.list?.[0];
                             // Result shape changed over time: older builds
                             // returned the LID under `lid`, current ones
@@ -980,6 +1056,19 @@ exports.LoadUtils = () => {
                     }
                 }
                 if (lidWid) {
+                    // Memoiza a resolução pn->lid antes mesmo do chat: ela
+                    // já é conhecida e vale para os próximos envios.
+                    try {
+                        window.WWebJS._pnLidMemo.set(
+                            chatWid.user,
+                            lidWid._serialized || String(lidWid),
+                        );
+                        if (window.WWebJS._pnLidMemo.size > 2000) {
+                            window.WWebJS._pnLidMemo.clear();
+                        }
+                    } catch (ignoredError) {
+                        // memo é otimização — nunca bloqueia o envio
+                    }
                     chat =
                         window.require('WAWebCollections').Chat.get(lidWid) ||
                         (
