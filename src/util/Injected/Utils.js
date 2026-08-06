@@ -806,7 +806,7 @@ exports.LoadUtils = () => {
         );
         // Lost-wakeup no uploader do WA Web (06/08/2026, grampo de rede):
         // o POST completa com HTTP 200 mas a promise do uploadMedia nunca
-        // resolve — deadlock de sessão por arquivo. Remédio: timeout de 90s
+        // resolve — deadlock de sessão por arquivo. Remédio: timeout de 45s
         // e UMA re-chamada; o arquivo já está no CDN da Meta, a segunda
         // chamada bate no dedupe e resolve em ms. Se pendurar de novo, o
         // erro sobe e o serviço decide (retry/restart dirigido).
@@ -841,7 +841,7 @@ exports.LoadUtils = () => {
         window.WWebJS._traceMedia('uploadMedia');
         let uploadedMedia;
         try {
-            uploadedMedia = await uploadWithTimeout(90000);
+            uploadedMedia = await uploadWithTimeout(45000);
         } catch (upErr) {
             if (
                 String(upErr && upErr.message).indexOf('media-upload-stuck') ===
@@ -850,7 +850,7 @@ exports.LoadUtils = () => {
                 throw upErr;
             }
             window.WWebJS._traceMedia('uploadMedia.retryInPage');
-            uploadedMedia = await uploadWithTimeout(90000);
+            uploadedMedia = await uploadWithTimeout(45000);
         }
         window.WWebJS._traceMedia('uploadMedia.done');
 
