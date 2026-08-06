@@ -154,6 +154,9 @@ exports.LoadUtils = () => {
     };
 
     window.WWebJS.sendMessage = async (chat, content, options = {}) => {
+        // Só envios COM mídia alimentam o rastro — texto em paralelo (pista
+        // dupla) não pode sobrescrever o marcador do envio travado
+        const _traceThis = !!options.media;
         const { getIsNewsletter, getIsBroadcast } =
             window.require('WAWebChatGetters');
         const isChannel = getIsNewsletter(chat);
@@ -584,10 +587,12 @@ exports.LoadUtils = () => {
             return msg;
         }
 
+        if (_traceThis) window.WWebJS._traceMedia('addAndSendMsgToChat');
         const [msgPromise, sendMsgResultPromise] = window
             .require('WAWebSendMsgChatAction')
             .addAndSendMsgToChat(chat, message);
         await msgPromise;
+        if (_traceThis) window.WWebJS._traceMedia('msgPromise.done');
 
         if (options.waitUntilMsgSent) await sendMsgResultPromise;
 
@@ -693,6 +698,15 @@ exports.LoadUtils = () => {
         return stickerInfo;
     };
 
+    // Rastro do último envio de mídia: a página segue viva depois que o
+    // Node desiste por protocolTimeout — o serviço lê este marcador pra
+    // saber EM QUAL estágio o pipeline parou (diagnóstico dos hangs de
+    // documento em chats com 9º dígito corrigido, 05-06/08/2026).
+    window.WWebJS._mediaTrace = null;
+    window.WWebJS._traceMedia = (stage) => {
+        window.WWebJS._mediaTrace = { stage, ts: Date.now() };
+    };
+
     window.WWebJS.processMediaData = async (
         mediaInfo,
         {
@@ -705,8 +719,10 @@ exports.LoadUtils = () => {
             sendToStatus,
         },
     ) => {
+        window.WWebJS._traceMedia('mediaInfoToFile');
         const file = window.WWebJS.mediaInfoToFile(mediaInfo);
         const OpaqueData = window.require('WAWebMediaOpaqueData');
+        window.WWebJS._traceMedia('opaqueData.createFromData');
         const opaqueData = await OpaqueData.createFromData(
             file,
             mediaInfo.mimetype,
@@ -722,10 +738,12 @@ exports.LoadUtils = () => {
             mediaParams.maxDimension = 2560;
         }
 
+        window.WWebJS._traceMedia('prepRawMedia.waitForPrep');
         const mediaPrep = window
             .require('WAWebPrepRawMedia')
             .prepRawMedia(opaqueData, mediaParams);
         const mediaData = await mediaPrep.waitForPrep();
+        window.WWebJS._traceMedia('mediaPrep.done');
         const mediaObject = window
             .require('WAWebMediaStorage')
             .getOrCreateMediaObject(mediaData.filehash);
@@ -786,9 +804,11 @@ exports.LoadUtils = () => {
         const { uploadMedia, uploadUnencryptedMedia } = window.require(
             'WAWebMediaMmsV4Upload',
         );
+        window.WWebJS._traceMedia('uploadMedia');
         const uploadedMedia = !sendToChannel
             ? await uploadMedia(dataToUpload)
             : await uploadUnencryptedMedia(dataToUpload);
+        window.WWebJS._traceMedia('uploadMedia.done');
 
         const mediaEntry = uploadedMedia.mediaEntry;
         if (!mediaEntry) {
