@@ -8,6 +8,10 @@ exports.LoadUtils = () => {
     // errorCode 429 "rate-overlimit" derruba a resolução inteira); o
     // backoff para de consultar por um tempo quando o 429 acontece.
     window.WWebJS._pnLidMemo = new Map();
+    // Stash de Files anexados via <input type=file> (sendFileFromDisk):
+    // o conteúdo entra no renderer pelo uploadFile do Puppeteer (Chrome lê
+    // do disco), nunca como base64 pelo CDP
+    window.WWebJS._mediaStash = new Map();
     window.WWebJS._usyncBackoffUntil = 0;
 
     /**
@@ -1337,7 +1341,28 @@ exports.LoadUtils = () => {
         );
     };
 
-    window.WWebJS.mediaInfoToFile = ({ data, mimetype, filename }) => {
+    window.WWebJS.mediaInfoToFile = ({ data, mimetype, filename, stashId }) => {
+        // Arquivo anexado via <input type=file> (uploadFile do Puppeteer):
+        // o Chrome leu o arquivo direto do disco — o conteúdo nunca
+        // atravessou o CDP como base64. O File nativo espera no stash.
+        if (stashId) {
+            const stash = window.WWebJS._mediaStash;
+            const file = stash && stash.get(stashId);
+            if (!file) {
+                throw new Error('media stash miss: ' + stashId);
+            }
+            stash.delete(stashId);
+            if (
+                file.name === filename &&
+                (!mimetype || file.type === mimetype)
+            ) {
+                return file;
+            }
+            return new File([file], filename || file.name, {
+                type: mimetype || file.type,
+                lastModified: Date.now(),
+            });
+        }
         const binaryData = window.atob(data);
 
         const buffer = new ArrayBuffer(binaryData.length);

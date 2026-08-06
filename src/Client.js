@@ -1438,6 +1438,90 @@ class Client extends EventEmitter {
      */
 
     /**
+     * Envia um arquivo do DISCO local como mídia, sem base64 pelo CDP.
+     *
+     * Caminho: injeta um <input type=file> escondido, usa uploadFile do
+     * Puppeteer (o protocolo passa só o CAMINHO — o próprio Chrome lê o
+     * arquivo do disco), estaciona o File nativo em WWebJS._mediaStash e
+     * envia via sendMessage com um MessageMedia "oco" que carrega apenas o
+     * stashId (mediaInfoToFile resolve o File do stash na página).
+     *
+     * Motivação: serializar mídia como base64 num único Runtime.callFunctionOn
+     * estourava protocolTimeout em arquivos pesados/patológicos (fila presa
+     * por 10min por arquivo — incidentes Central/Serra 05-06/08/2026).
+     *
+     * @param {string} chatId
+     * @param {string} filePath - caminho absoluto do arquivo no disco
+     * @param {MessageSendOptions & {filename?: string, mimetype?: string}} [options]
+     * @returns {Promise<Message>}
+     */
+    async sendFileFromDisk(chatId, filePath, options = {}) {
+        const path = require('path');
+        const filename = options.filename || path.basename(filePath);
+        const mimetype = options.mimetype || 'application/octet-stream';
+
+        await this.pupPage.evaluate(() => {
+            let el = document.getElementById('wwebjs-disk-upload');
+            if (!el) {
+                el = document.createElement('input');
+                el.type = 'file';
+                el.id = 'wwebjs-disk-upload';
+                el.style.display = 'none';
+                document.body.appendChild(el);
+            }
+            el.value = '';
+        });
+
+        const inputHandle = await this.pupPage.$('#wwebjs-disk-upload');
+        if (!inputHandle) {
+            throw new Error('sendFileFromDisk: input de upload não encontrado');
+        }
+        await inputHandle.uploadFile(filePath);
+
+        const stashId = await this.pupPage.evaluate(() => {
+            const el = document.getElementById('wwebjs-disk-upload');
+            const f = el && el.files && el.files[0];
+            if (!f) {
+                throw new Error(
+                    'sendFileFromDisk: uploadFile não populou o input',
+                );
+            }
+            if (!window.WWebJS._mediaStash) {
+                window.WWebJS._mediaStash = new Map();
+            }
+            const id =
+                'stash_' +
+                Date.now() +
+                '_' +
+                Math.random().toString(36).slice(2);
+            window.WWebJS._mediaStash.set(id, f);
+            el.value = '';
+            return id;
+        });
+
+        const media = new MessageMedia(mimetype, null, filename, null);
+        media.stashId = stashId;
+
+        const sendOptions = { ...options };
+        delete sendOptions.filename;
+        delete sendOptions.mimetype;
+
+        try {
+            return await this.sendMessage(chatId, media, sendOptions);
+        } catch (err) {
+            // Falhou antes de consumir o stash? Limpa pra não vazar o File
+            await this.pupPage
+                .evaluate((id) => {
+                    if (window.WWebJS._mediaStash) {
+                        window.WWebJS._mediaStash.delete(id);
+                    }
+                }, stashId)
+                .catch(() => {});
+            throw err;
+        }
+    }
+
+    /**
      * Send a message to a specific chatId
      * @param {string} chatId
      * @param {string|MessageMedia|Location|Poll|Contact|Array<Contact>|Buttons|List} content
