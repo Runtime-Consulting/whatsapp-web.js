@@ -804,10 +804,54 @@ exports.LoadUtils = () => {
         const { uploadMedia, uploadUnencryptedMedia } = window.require(
             'WAWebMediaMmsV4Upload',
         );
+        // Lost-wakeup no uploader do WA Web (06/08/2026, grampo de rede):
+        // o POST completa com HTTP 200 mas a promise do uploadMedia nunca
+        // resolve — deadlock de sessão por arquivo. Remédio: timeout de 90s
+        // e UMA re-chamada; o arquivo já está no CDN da Meta, a segunda
+        // chamada bate no dedupe e resolve em ms. Se pendurar de novo, o
+        // erro sobe e o serviço decide (retry/restart dirigido).
+        const doUpload = () =>
+            !sendToChannel
+                ? uploadMedia(dataToUpload)
+                : uploadUnencryptedMedia(dataToUpload);
+        const uploadWithTimeout = (ms) =>
+            new Promise((resolve, reject) => {
+                const timer = setTimeout(
+                    () =>
+                        reject(
+                            new Error(
+                                'media-upload-stuck: uploadMedia sem resposta em ' +
+                                    ms +
+                                    'ms',
+                            ),
+                        ),
+                    ms,
+                );
+                doUpload().then(
+                    (v) => {
+                        clearTimeout(timer);
+                        resolve(v);
+                    },
+                    (e) => {
+                        clearTimeout(timer);
+                        reject(e);
+                    },
+                );
+            });
         window.WWebJS._traceMedia('uploadMedia');
-        const uploadedMedia = !sendToChannel
-            ? await uploadMedia(dataToUpload)
-            : await uploadUnencryptedMedia(dataToUpload);
+        let uploadedMedia;
+        try {
+            uploadedMedia = await uploadWithTimeout(90000);
+        } catch (upErr) {
+            if (
+                String(upErr && upErr.message).indexOf('media-upload-stuck') ===
+                -1
+            ) {
+                throw upErr;
+            }
+            window.WWebJS._traceMedia('uploadMedia.retryInPage');
+            uploadedMedia = await uploadWithTimeout(90000);
+        }
         window.WWebJS._traceMedia('uploadMedia.done');
 
         const mediaEntry = uploadedMedia.mediaEntry;
