@@ -20,7 +20,14 @@ exports.LoadUtils = () => {
         if (typeof origGet === 'function' && !abMod.__wwebjsUploadPatch) {
             abMod.__wwebjsUploadPatch = true;
             abMod.getABPropConfigValue = function (key) {
-                if (key === 'web_media_encrypt_upload_in_worker_enabled') {
+                // Worker por padrão (página livre); main thread SÓ quando a
+                // flag de retry está ligada — criptografia main-thread de
+                // vídeo pesado bloqueia a página e derruba o heartbeat
+                // (tempestade de restarts 07/08 18:22)
+                if (
+                    key === 'web_media_encrypt_upload_in_worker_enabled' &&
+                    window.WWebJS._forceMainThreadUpload === true
+                ) {
                     return false;
                 }
                 return origGet.apply(this, arguments);
@@ -929,8 +936,14 @@ exports.LoadUtils = () => {
                 window.WWebJS._traceMedia('uploadMedia.cancelErr');
             }
             await refreshMediaConn();
+            // Retry bypassa o worker pendurado: main thread só nesta chamada
+            window.WWebJS._forceMainThreadUpload = true;
             window.WWebJS._traceMedia('uploadMedia.retryInPage');
-            uploadedMedia = await uploadWithTimeout(45000);
+            try {
+                uploadedMedia = await uploadWithTimeout(45000);
+            } finally {
+                window.WWebJS._forceMainThreadUpload = false;
+            }
         }
         window.WWebJS._traceMedia('uploadMedia.done');
 
