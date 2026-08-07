@@ -855,17 +855,26 @@ exports.LoadUtils = () => {
                 const mod = window.require('WAWebMediaHosts');
                 const mh = mod && (mod.mediaHosts || mod.default);
                 if (mh && typeof mh.forceRefresh === 'function') {
+                    // $4 = estado de backoff pós-E507 do servidor: nesse
+                    // estado forceRefresh() resolve FALSE na hora (no-op).
+                    // Distinguir é a prova do throttle server-side da Meta.
+                    const preBackoff = !!mh.$4;
                     const ok = await Promise.race([
                         mh.forceRefresh(),
                         new Promise((res) => {
                             setTimeout(() => res('timeout'), 15000);
                         }),
                     ]);
-                    window.WWebJS._mediaRefresh = {
-                        info: ok === 'timeout' ? 'timeout' : 'ok',
-                        ts: Date.now(),
-                    };
-                    return ok !== 'timeout';
+                    const info =
+                        ok === 'timeout'
+                            ? 'timeout'
+                            : ok === false
+                              ? preBackoff
+                                  ? 'backoff-e507'
+                                  : 'false'
+                              : 'ok';
+                    window.WWebJS._mediaRefresh = { info, ts: Date.now() };
+                    return ok === true;
                 }
             } catch (ignoredError) {
                 window.WWebJS._mediaRefresh = { info: 'err', ts: Date.now() };
