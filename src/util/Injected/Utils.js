@@ -8,6 +8,28 @@ exports.LoadUtils = () => {
     // errorCode 429 "rate-overlimit" derruba a resolução inteira); o
     // backoff para de consultar por um tempo quando o 429 acontece.
     window.WWebJS._pnLidMemo = new Map();
+    // Força upload de mídia na MAIN THREAD. O WAWebUploadManager roteia
+    // upload criptografado pro Web Worker quando a ABProp
+    // web_media_encrypt_upload_in_worker_enabled está ligada — e a
+    // ponte/worker pendura por sessão (deadlock pré-rede 06-07/08/2026:
+    // página viva, textos ok, uploadMedia nunca resolve, restart cura).
+    // Main thread usa o mesmo pipeline de criptografia sem a ponte.
+    try {
+        const abMod = window.require('WAWebABProps');
+        const origGet = abMod.getABPropConfigValue;
+        if (typeof origGet === 'function' && !abMod.__wwebjsUploadPatch) {
+            abMod.__wwebjsUploadPatch = true;
+            abMod.getABPropConfigValue = function (key) {
+                if (key === 'web_media_encrypt_upload_in_worker_enabled') {
+                    return false;
+                }
+                return origGet.apply(this, arguments);
+            };
+            window.WWebJS._uploadWorkerPatched = true;
+        }
+    } catch (ignoredErrorAbProps) {
+        window.WWebJS._uploadWorkerPatched = false;
+    }
     // Stash de Files anexados via <input type=file> (sendFileFromDisk):
     // o conteúdo entra no renderer pelo uploadFile do Puppeteer (Chrome lê
     // do disco), nunca como base64 pelo CDP
