@@ -845,37 +845,33 @@ exports.LoadUtils = () => {
         // O nome do módulo varia por versão do bundle — descoberta com
         // candidatos + rastro de qual funcionou.
         const refreshMediaConn = async () => {
-            const candidates = [
-                'WAWebMediaConnApi',
-                'WAWebMediaConn',
-                'WAWebMmsMediaConn',
-                'WAWebMediaConnActions',
-                'WAWebMediaConnCache',
-            ];
-            for (const name of candidates) {
-                let mod;
-                try {
-                    mod = window.require(name);
-                } catch (ignoredErrorReq) {
-                    continue;
+            // Módulo REAL deste bundle (extraído de b7.js 07/08):
+            // WAWebMediaHosts.mediaHosts.forceRefresh() reseta a query
+            // memoizada ($5) e dispara IQ novo de media_conn no socket.
+            // O deadlock é o memo preso de um IQ perdido — os textos fluem,
+            // o socket está vivo, a query nova resolve em ms. Race de 15s
+            // pra não trocar um hang por outro (backstop: restart).
+            try {
+                const mod = window.require('WAWebMediaHosts');
+                const mh = mod && (mod.mediaHosts || mod.default);
+                if (mh && typeof mh.forceRefresh === 'function') {
+                    const ok = await Promise.race([
+                        mh.forceRefresh(),
+                        new Promise((res) => {
+                            setTimeout(() => res('timeout'), 15000);
+                        }),
+                    ]);
+                    window.WWebJS._mediaRefresh = {
+                        info: ok === 'timeout' ? 'timeout' : 'ok',
+                        ts: Date.now(),
+                    };
+                    return ok !== 'timeout';
                 }
-                if (!mod) continue;
-                const fn =
-                    mod.refreshMediaConn ||
-                    mod.forceRefreshMediaConn ||
-                    mod.getMediaConn ||
-                    mod.default;
-                if (typeof fn !== 'function') continue;
-                try {
-                    // getMediaConn(true) = force refresh nas versões conhecidas
-                    await fn(true);
-                    window.WWebJS._traceMedia('refreshConn.ok:' + name);
-                    return true;
-                } catch (ignoredErrorRefresh) {
-                    window.WWebJS._traceMedia('refreshConn.err:' + name);
-                }
+            } catch (ignoredError) {
+                window.WWebJS._mediaRefresh = { info: 'err', ts: Date.now() };
+                return false;
             }
-            window.WWebJS._traceMedia('refreshConn.miss');
+            window.WWebJS._mediaRefresh = { info: 'miss', ts: Date.now() };
             return false;
         };
 
