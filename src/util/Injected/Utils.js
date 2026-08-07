@@ -838,6 +838,47 @@ exports.LoadUtils = () => {
                     },
                 );
             });
+        // Refresh forçado do mediaConn (token de upload MMS). Evidência
+        // 07/08 (grampo de rede): nos travamentos o POST NUNCA sai do
+        // browser — o uploadMedia morre aguardando o token; sessão nova =
+        // token novo = funciona. Renovar o token in-page cura sem restart.
+        // O nome do módulo varia por versão do bundle — descoberta com
+        // candidatos + rastro de qual funcionou.
+        const refreshMediaConn = async () => {
+            const candidates = [
+                'WAWebMediaConnApi',
+                'WAWebMediaConn',
+                'WAWebMmsMediaConn',
+                'WAWebMediaConnActions',
+                'WAWebMediaConnCache',
+            ];
+            for (const name of candidates) {
+                let mod;
+                try {
+                    mod = window.require(name);
+                } catch (ignoredErrorReq) {
+                    continue;
+                }
+                if (!mod) continue;
+                const fn =
+                    mod.refreshMediaConn ||
+                    mod.forceRefreshMediaConn ||
+                    mod.getMediaConn ||
+                    mod.default;
+                if (typeof fn !== 'function') continue;
+                try {
+                    // getMediaConn(true) = force refresh nas versões conhecidas
+                    await fn(true);
+                    window.WWebJS._traceMedia('refreshConn.ok:' + name);
+                    return true;
+                } catch (ignoredErrorRefresh) {
+                    window.WWebJS._traceMedia('refreshConn.err:' + name);
+                }
+            }
+            window.WWebJS._traceMedia('refreshConn.miss');
+            return false;
+        };
+
         window.WWebJS._traceMedia('uploadMedia');
         let uploadedMedia;
         try {
@@ -849,6 +890,7 @@ exports.LoadUtils = () => {
             ) {
                 throw upErr;
             }
+            await refreshMediaConn();
             window.WWebJS._traceMedia('uploadMedia.retryInPage');
             uploadedMedia = await uploadWithTimeout(45000);
         }
