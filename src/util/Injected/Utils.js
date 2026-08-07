@@ -801,9 +801,8 @@ exports.LoadUtils = () => {
                 : {}),
         };
 
-        const { uploadMedia, uploadUnencryptedMedia } = window.require(
-            'WAWebMediaMmsV4Upload',
-        );
+        const { uploadMedia, uploadUnencryptedMedia, cancelUploadMedia } =
+            window.require('WAWebMediaMmsV4Upload');
         // Lost-wakeup no uploader do WA Web (06/08/2026, grampo de rede):
         // o POST completa com HTTP 200 mas a promise do uploadMedia nunca
         // resolve — deadlock de sessão por arquivo. Remédio: timeout de 45s
@@ -894,6 +893,18 @@ exports.LoadUtils = () => {
                 -1
             ) {
                 throw upErr;
+            }
+            // Mata a promise-zumbi de upload presa no mediaObject (dedupe
+            // por filehash) — sem isso o retry re-agarra no mesmo upload
+            // pendurado em vez de disparar um novo (explica a persistência
+            // POR ARQUIVO do deadlock dentro da sessão).
+            try {
+                if (typeof cancelUploadMedia === 'function') {
+                    cancelUploadMedia(mediaObject);
+                    window.WWebJS._traceMedia('uploadMedia.cancelled');
+                }
+            } catch (ignoredErrorCancel) {
+                window.WWebJS._traceMedia('uploadMedia.cancelErr');
             }
             await refreshMediaConn();
             window.WWebJS._traceMedia('uploadMedia.retryInPage');
