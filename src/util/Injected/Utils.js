@@ -1571,15 +1571,63 @@ exports.LoadUtils = () => {
             return null;
         }
 
-        const cached = window
-            .require('WAWebMediaInMemoryBlobCache')
-            .InMemoryMediaBlobCache.get(msg.mediaObject?.filehash);
+        const cacheApi = window.require(
+            'WAWebMediaInMemoryBlobCache',
+        ).InMemoryMediaBlobCache;
+        const filehash = msg.mediaObject?.filehash;
 
-        let blob;
-        if (cached) {
-            blob = cached;
-        } else if (msg.mediaObject?.mediaBlob) {
-            blob = msg.mediaObject.mediaBlob.forceToBlob();
+        const pickBlob = () => {
+            const cached = cacheApi.get(filehash);
+            if (cached) return cached;
+            if (msg.mediaObject?.mediaBlob) {
+                return msg.mediaObject.mediaBlob.forceToBlob();
+            }
+            return null;
+        };
+
+        // DOCUMENTO é cacheado como File disk-backed (com filename); imagem/
+        // áudio/vídeo entram como Blob de memória. Quando o Chromium recicla
+        // o arquivo de lastro do File, `size` continua intacto mas ler os
+        // bytes (arrayBuffer/slice) lança NotFoundError NATIVO, síncrono e
+        // determinístico — e o engine faz short-circuit nesse filehash e
+        // NUNCA re-baixa (5 retries falham idênticos). Diagnóstico ao vivo
+        // 17/08 (VM Yara): entry mantém directPath+encFilehash+mediaKey → o
+        // blob de origem NÃO morreu, só o cache local. Cura validada:
+        // despejar o filehash + resetar stage=INIT + re-downloadMedia refaz
+        // o download da rede e produz um Blob de memória vivo.
+        const probeAlive = async (b) => {
+            try {
+                await b.slice(0, 1).arrayBuffer();
+                return true;
+            } catch (ignoredError) {
+                return false;
+            }
+        };
+
+        let blob = pickBlob();
+        if (blob && !(await probeAlive(blob))) {
+            try {
+                cacheApi.delete(filehash);
+            } catch (ignoredError) {
+                /* método varia por versão do bundle */
+            }
+            try {
+                const { DownloadStage } = window.require('WAWebMediaTypes');
+                msg.mediaObject?.clearBlob?.();
+                msg.mediaObject?.consolidate?.({
+                    downloadStage: DownloadStage.INIT,
+                });
+            } catch (ignoredError) {
+                /* reset best-effort */
+            }
+            await msg.downloadMedia({
+                downloadEvenIfExpensive: true,
+                rmrReason: 1,
+                isUserInitiated: true,
+            });
+            blob = pickBlob();
+            // Re-fetch também morto (blob realmente indisponível): desiste.
+            if (blob && !(await probeAlive(blob))) return null;
         }
 
         if (!blob) return null;
