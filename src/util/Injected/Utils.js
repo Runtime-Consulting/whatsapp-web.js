@@ -526,14 +526,12 @@ exports.LoadUtils = () => {
             ...extraOptions,
         };
 
-        // WA Web >= 2.3000.10477x: processMediaData retorna um MediaData com um
-        // campo interno __x_id que, ao ser spreadado acima, sobrescreve o id
-        // (MsgKey) da Msg. Aí o getter memoizado recebe undefined e o envio de
-        // midia quebra com "Data passed to getter must include an id property
-        // (it's how we memoize) but got undefined". Texto puro nao passa por
-        // processMediaData, por isso so midia era afetada. (wwebjs PR #201923)
-        delete message.__x_id;
-
+        // MediaData is a model whose private __x_id field collides with Msg's
+        // internal id field when its enumerable properties are spread above,
+        // breaking getValidatedSender() during Msg initialization.
+        if (message.__x_id) {
+            delete message.__x_id;
+        }
         // Bot's won't reply if canonicalUrl is set (linking)
         if (botOptions) {
             delete message.canonicalUrl;
