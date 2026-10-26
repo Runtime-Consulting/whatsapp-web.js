@@ -1126,13 +1126,29 @@ exports.LoadUtils = () => {
                 } else if (!lidWid) {
                     let usyncQuery = null;
                     try {
-                        usyncQuery = window
+                        // WA Web 2.3000.1051706590+ tornou
+                        // constructUsyncDeltaQuery assíncrona (anexa os
+                        // privacy hints antes de devolver a query): sem o
+                        // await, `.execute` era chamado na Promise e todo
+                        // envio pra contato sem LID em cache falhava com
+                        // "usyncQuery.execute is not a function" (Tecelar
+                        // 26/10). O await também funciona na versão antiga,
+                        // que devolve a query direto.
+                        usyncQuery = await window
                             .require('WAWebContactSyncUtils')
                             .constructUsyncDeltaQuery([
                                 { type: 'add', phoneNumber: chatWid.user },
                             ]);
+                        if (typeof usyncQuery?.execute !== 'function') {
+                            throw new Error(
+                                'delta query sem execute (' +
+                                    typeof usyncQuery +
+                                    ')',
+                            );
+                        }
                         lidDiag.push('util=ok');
                     } catch (utilError) {
+                        usyncQuery = null;
                         lidDiag.push(
                             'util_err=' + (utilError?.message || utilError),
                         );
