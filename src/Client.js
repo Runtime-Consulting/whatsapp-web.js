@@ -14,11 +14,6 @@ const {
 } = require('./util/Constants');
 const { LoadUtils } = require('./util/Injected/Utils');
 
-// Erros de CDP que significam "o documento/alvo foi trocado no meio" (navegação,
-// reload de atualização do WA Web, troca de processo do renderer), não falha
-// do passo em si.
-const PAGE_REPLACED_RE =
-    /Target closed|Session closed|Execution context was destroyed|detached Frame|Navigating frame was detached|Cannot find context with specified id/i;
 const ChatFactory = require('./factories/ChatFactory');
 const ContactFactory = require('./factories/ContactFactory');
 const WebCacheFactory = require('./webCache/WebCacheFactory');
@@ -632,9 +627,10 @@ class Client extends EventEmitter {
      * - "Montado" = `window.__wwebjsAttached` (listeners ligados), não só
      *   `window.WWebJS`: depois de uma falha, a página não é tratada como
      *   pronta pela metade.
-     * - `attachEventListeners` registra listeners na página sem limpeza:
-     *   roda no máximo uma vez por documento (`__wwebjsAttachStarted`). Se
-     *   começou e não terminou, desiste em vez de religar.
+     * - `attachEventListeners` pode ser repetido: o registro das funções
+     *   ignora as que já existem (e refaz a que ficou pela metade no
+     *   Puppeteer) e o bloco que liga os listeners na página só roda uma vez
+     *   por documento (`__wwebjsListenersRegistered`).
      * - Se a página recarregar no meio, a execução é abandonada: o
      *   framenavigated → inject() cuida do documento novo.
      *
@@ -670,7 +666,6 @@ class Client extends EventEmitter {
                     this.pupPage.evaluate(() => ({
                         doc: performance.timeOrigin,
                         attached: window.__wwebjsAttached === true,
-                        attachStarted: window.__wwebjsAttachStarted === true,
                         utils: typeof window.WWebJS !== 'undefined',
                     })),
                     stepTimeout,
@@ -685,15 +680,6 @@ class Client extends EventEmitter {
                 }
 
                 if (!state.attached) {
-                    if (state.attachStarted) {
-                        step = 'attach_incomplete';
-                        const e = new Error(
-                            'listeners ligados pela metade neste documento',
-                        );
-                        e.readyFinal = true;
-                        throw e;
-                    }
-
                     if (
                         !persisted &&
                         opt.webVersionCache &&
@@ -766,14 +752,7 @@ class Client extends EventEmitter {
                         infoLoaded = true;
                     }
 
-                    step = 'attach_mark';
-                    await this._withStepTimeout(
-                        step,
-                        this.pupPage.evaluate(() => {
-                            window.__wwebjsAttachStarted = true;
-                        }),
-                        stepTimeout,
-                    );
+                    // Repetível: ver attachEventListeners e exposeFunctionIfAbsent.
                     step = 'attach_listeners';
                     await this._withStepTimeout(
                         step,
@@ -796,22 +775,14 @@ class Client extends EventEmitter {
                     attempts,
                     error: String((err && err.message) || err),
                 };
-                if (PAGE_REPLACED_RE.test(info.error) && !this._browserGone()) {
-                    // A página foi trocada no meio (o WA Web se recarrega
-                    // sozinho para se atualizar, logo depois de autenticar):
-                    // não é falha. O framenavigated → inject() monta o
-                    // documento novo; se isso não acontecer, quem usa a lib
-                    // (ex.: o stuck_on_authenticated do serviço) reinicia.
-                    // Medido na Tecelar em 23/11: attach_listeners com
-                    // "Target closed" virava restart à toa.
-                    console.warn(
-                        `[wwebjs] ready: página trocada no passo ${step} (${info.error}); o inject() da página nova assume`,
-                    );
-                    return false;
-                }
+                // "Target closed" no Runtime.addBinding vem de um frame
+                // secundário que sumiu enquanto o Puppeteer registrava a
+                // função em todos os frames (Tecelar, 23/11): a página
+                // principal segue igual e a tentativa seguinte resolve. Se a
+                // página principal foi trocada de verdade, a checagem de
+                // documento da próxima tentativa abandona.
                 if (
                     (err && err.readyFinal) ||
-                    step === 'attach_listeners' ||
                     attempt >= attempts ||
                     this._pageGone()
                 ) {
@@ -862,19 +833,6 @@ class Client extends EventEmitter {
         });
         return Promise.race([guarded, timeout]).finally(() =>
             clearTimeout(timer),
-        );
-    }
-
-    /**
-     * Browser desconectado (o processo do Chrome caiu ou foi fechado).
-     * @private
-     */
-    _browserGone() {
-        const browser = this.pupBrowser;
-        return !!(
-            browser &&
-            typeof browser.isConnected === 'function' &&
-            !browser.isConnected()
         );
     }
 
@@ -1357,6 +1315,12 @@ class Client extends EventEmitter {
         );
 
         await this.pupPage.evaluate(() => {
+            // Uma vez por documento: o attachEventListeners pode ser repetido
+            // (registro de função que falhou no meio), e religar os Msg.on /
+            // injectToFunction duplicaria eventos.
+            if (window.__wwebjsListenersRegistered) return;
+            window.__wwebjsListenersRegistered = true;
+
             const { Msg, Chat } = window.require('WAWebCollections');
             const AppState = window.require('WAWebSocketModel').Socket;
 

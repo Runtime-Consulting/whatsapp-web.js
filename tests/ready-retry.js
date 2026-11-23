@@ -66,7 +66,6 @@ function fakeClient({
                 return {
                     doc: page.doc,
                     attached: page.attached,
-                    attachStarted: page.attachStarted,
                     utils: page.utils,
                 };
             }
@@ -198,27 +197,6 @@ describe('Client: caminho authenticated → ready', function () {
         ]);
     });
 
-    it('falha no attach_listeners: não repete (evita listener duplicado) e não emite READY', async function () {
-        const { client, calls, emitted } = fakeClient({
-            failures: { attach_listeners: 1 },
-        });
-        const err = await catchError(
-            client._injectUtilsAndEmitReady('2.3000.1'),
-        );
-        expect(err.readyInfo.step).to.equal('attach_listeners');
-        expect(calls.attach).to.equal(1);
-        expect(emitted).to.not.include(Events.READY);
-    });
-
-    it('listeners ligados pela metade neste documento: desiste sem religar', async function () {
-        const { client, calls } = fakeClient({ attachStarted: true });
-        const err = await catchError(
-            client._injectUtilsAndEmitReady('2.3000.1'),
-        );
-        expect(err.readyInfo.step).to.equal('attach_incomplete');
-        expect(calls.attach).to.equal(0);
-    });
-
     it('esgotadas as tentativas: lança com o passo e não emite READY', async function () {
         const { client, emitted } = fakeClient({
             failures: { wait_utils: 10 },
@@ -297,45 +275,6 @@ describe('Client: caminho authenticated → ready', function () {
         ]);
     });
 
-    it('erro no caminho vira ready_failed com o passo (não morre em silêncio)', async function () {
-        const { client, emitted } = fakeClient({
-            failures: { attach_listeners: 1 },
-        });
-        await client._onAppStateHasSynced('2.3000.1');
-        expect(emitted).to.deep.equal([
-            Events.AUTHENTICATED,
-            `${Events.READY_FAILED}:attach_listeners`,
-        ]);
-    });
-
-    it('página trocada no attach (Target closed): abandona sem READY_FAILED, o inject() da página nova assume', async function () {
-        const { client, calls, emitted } = fakeClient({
-            failures: { attach_listeners: 1 },
-            failMessages: {
-                attach_listeners:
-                    'Protocol error (Page.addScriptToEvaluateOnNewDocument): Target closed',
-            },
-        });
-        await client._onAppStateHasSynced('2.3000.1');
-        expect(calls.attach).to.equal(1);
-        expect(emitted).to.deep.equal([Events.AUTHENTICATED]);
-    });
-
-    it('contexto destruído no load_utils (navegação): abandona sem tentar de novo', async function () {
-        const { client, calls, emitted } = fakeClient({
-            failures: { load_utils: 1 },
-            failMessages: {
-                load_utils:
-                    'Execution context was destroyed, most likely because of a navigation.',
-            },
-        });
-        expect(await client._injectUtilsAndEmitReady('2.3000.1')).to.equal(
-            false,
-        );
-        expect(calls.loadUtils).to.equal(1);
-        expect(emitted).to.deep.equal([]);
-    });
-
     it('Target closed com o browser caído: aí sim é ready_failed', async function () {
         const { client, emitted } = fakeClient({
             failures: { attach_listeners: 1 },
@@ -347,5 +286,47 @@ describe('Client: caminho authenticated → ready', function () {
             Events.AUTHENTICATED,
             `${Events.READY_FAILED}:attach_listeners`,
         ]);
+    });
+
+    it('falha passageira no attach_listeners: repete (o attach é idempotente) e emite READY', async function () {
+        const { client, calls, emitted, page } = fakeClient({
+            failures: { attach_listeners: 1 },
+        });
+        await client._injectUtilsAndEmitReady('2.3000.1');
+        expect(calls.attach).to.equal(2);
+        expect(page.attached).to.equal(true);
+        expect(emitted).to.deep.equal([
+            `${Events.READY_RETRY}:attach_listeners`,
+            Events.READY,
+        ]);
+    });
+
+    it('Target closed no Runtime.addBinding (frame secundário), mesma página: repete e sobe (caso Tecelar 23/11)', async function () {
+        const { client, calls, emitted } = fakeClient({
+            failures: { attach_listeners: 1 },
+            failMessages: {
+                attach_listeners:
+                    'Protocol error (Runtime.addBinding): Target closed',
+            },
+        });
+        await client._onAppStateHasSynced('2.3000.1');
+        expect(calls.attach).to.equal(2);
+        expect(emitted).to.deep.equal([
+            Events.AUTHENTICATED,
+            `${Events.READY_RETRY}:attach_listeners`,
+            Events.READY,
+        ]);
+    });
+
+    it('esgotadas as tentativas, o _onAppStateHasSynced reporta ready_failed com o passo', async function () {
+        const { client, emitted } = fakeClient({
+            failures: { wait_utils: 10 },
+        });
+        await client._onAppStateHasSynced('2.3000.1');
+        expect(emitted[0]).to.equal(Events.AUTHENTICATED);
+        expect(emitted[emitted.length - 1]).to.equal(
+            `${Events.READY_FAILED}:wait_utils`,
+        );
+        expect(emitted).to.not.include(Events.READY);
     });
 });

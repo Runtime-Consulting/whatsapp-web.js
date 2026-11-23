@@ -17,7 +17,18 @@ async function exposeFunctionIfAbsent(page, name, fn) {
     if (exist) {
         return;
     }
-    await page.exposeFunction(name, fn);
+    try {
+        await page.exposeFunction(name, fn);
+    } catch (err) {
+        // Uma tentativa anterior falhou no meio (ex.: "Target closed" no
+        // Runtime.addBinding de um frame secundário): o Puppeteer guardou o
+        // binding, mas a página não tem a função. Refaz do zero.
+        if (!/already exists/i.test(String((err && err.message) || err))) {
+            throw err;
+        }
+        await page.removeExposedFunction(name).catch(() => {});
+        await page.exposeFunction(name, fn);
+    }
 }
 
 module.exports = { exposeFunctionIfAbsent };
