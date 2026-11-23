@@ -18,6 +18,8 @@ function fakeClient({
     reloadOnInfoFail = false,
     options = {},
     readyListenerThrows = false,
+    failMessages = {},
+    browserConnected = true,
 } = {}) {
     const calls = {
         loadUtils: 0,
@@ -39,7 +41,7 @@ function fakeClient({
     const fail = (step) => {
         if (counters[step] > 0) {
             counters[step] -= 1;
-            throw new Error(`falha simulada em ${step}`);
+            throw new Error(failMessages[step] || `falha simulada em ${step}`);
         }
     };
     const maybeHang = (step) => {
@@ -98,7 +100,7 @@ function fakeClient({
     const client = Object.create(Client.prototype);
     Object.assign(client, {
         pupPage,
-        pupBrowser: { isConnected: () => true },
+        pupBrowser: { isConnected: () => browserConnected },
         options: {
             webVersionCache: { type: 'none' },
             readyRetryDelaysMs: [1, 1, 1],
@@ -298,6 +300,47 @@ describe('Client: caminho authenticated → ready', function () {
     it('erro no caminho vira ready_failed com o passo (não morre em silêncio)', async function () {
         const { client, emitted } = fakeClient({
             failures: { attach_listeners: 1 },
+        });
+        await client._onAppStateHasSynced('2.3000.1');
+        expect(emitted).to.deep.equal([
+            Events.AUTHENTICATED,
+            `${Events.READY_FAILED}:attach_listeners`,
+        ]);
+    });
+
+    it('página trocada no attach (Target closed): abandona sem READY_FAILED, o inject() da página nova assume', async function () {
+        const { client, calls, emitted } = fakeClient({
+            failures: { attach_listeners: 1 },
+            failMessages: {
+                attach_listeners:
+                    'Protocol error (Page.addScriptToEvaluateOnNewDocument): Target closed',
+            },
+        });
+        await client._onAppStateHasSynced('2.3000.1');
+        expect(calls.attach).to.equal(1);
+        expect(emitted).to.deep.equal([Events.AUTHENTICATED]);
+    });
+
+    it('contexto destruído no load_utils (navegação): abandona sem tentar de novo', async function () {
+        const { client, calls, emitted } = fakeClient({
+            failures: { load_utils: 1 },
+            failMessages: {
+                load_utils:
+                    'Execution context was destroyed, most likely because of a navigation.',
+            },
+        });
+        expect(await client._injectUtilsAndEmitReady('2.3000.1')).to.equal(
+            false,
+        );
+        expect(calls.loadUtils).to.equal(1);
+        expect(emitted).to.deep.equal([]);
+    });
+
+    it('Target closed com o browser caído: aí sim é ready_failed', async function () {
+        const { client, emitted } = fakeClient({
+            failures: { attach_listeners: 1 },
+            failMessages: { attach_listeners: 'Target closed' },
+            browserConnected: false,
         });
         await client._onAppStateHasSynced('2.3000.1');
         expect(emitted).to.deep.equal([

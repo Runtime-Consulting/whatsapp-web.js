@@ -13,6 +13,12 @@ const {
     MessageTypes,
 } = require('./util/Constants');
 const { LoadUtils } = require('./util/Injected/Utils');
+
+// Erros de CDP que significam "o documento/alvo foi trocado no meio" (navegação,
+// reload de atualização do WA Web, troca de processo do renderer), não falha
+// do passo em si.
+const PAGE_REPLACED_RE =
+    /Target closed|Session closed|Execution context was destroyed|detached Frame|Navigating frame was detached|Cannot find context with specified id/i;
 const ChatFactory = require('./factories/ChatFactory');
 const ContactFactory = require('./factories/ContactFactory');
 const WebCacheFactory = require('./webCache/WebCacheFactory');
@@ -790,6 +796,19 @@ class Client extends EventEmitter {
                     attempts,
                     error: String((err && err.message) || err),
                 };
+                if (PAGE_REPLACED_RE.test(info.error) && !this._browserGone()) {
+                    // A página foi trocada no meio (o WA Web se recarrega
+                    // sozinho para se atualizar, logo depois de autenticar):
+                    // não é falha. O framenavigated → inject() monta o
+                    // documento novo; se isso não acontecer, quem usa a lib
+                    // (ex.: o stuck_on_authenticated do serviço) reinicia.
+                    // Medido na Tecelar em 23/11: attach_listeners com
+                    // "Target closed" virava restart à toa.
+                    console.warn(
+                        `[wwebjs] ready: página trocada no passo ${step} (${info.error}); o inject() da página nova assume`,
+                    );
+                    return false;
+                }
                 if (
                     (err && err.readyFinal) ||
                     step === 'attach_listeners' ||
@@ -843,6 +862,19 @@ class Client extends EventEmitter {
         });
         return Promise.race([guarded, timeout]).finally(() =>
             clearTimeout(timer),
+        );
+    }
+
+    /**
+     * Browser desconectado (o processo do Chrome caiu ou foi fechado).
+     * @private
+     */
+    _browserGone() {
+        const browser = this.pupBrowser;
+        return !!(
+            browser &&
+            typeof browser.isConnected === 'function' &&
+            !browser.isConnected()
         );
     }
 
