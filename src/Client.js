@@ -290,40 +290,7 @@ class Client extends EventEmitter {
                 this.pupPage,
                 'onAppStateHasSyncedEvent',
                 async () => {
-                    // Uma execução por vez: a página chama isto a cada mudança
-                    // de hasSynced, e duas em paralelo injetavam e emitiam
-                    // READY em dobro.
-                    if (this._readyInFlight) return;
-                    this._readyInFlight = true;
-                    try {
-                        const authEventPayload =
-                            await this.authStrategy.getAuthEventPayload();
-                        /**
-                         * Emitted when authentication is successful
-                         * @event Client#authenticated
-                         */
-                        this.emit(Events.AUTHENTICATED, authEventPayload);
-
-                        await this._injectUtilsAndEmitReady(version);
-                    } catch (err) {
-                        // Antes, qualquer erro aqui morria dentro da página
-                        // (a função é chamada por um listener Backbone, sem
-                        // await): sem log, sem nova tentativa, e o READY
-                        // nunca chegava.
-                        const info =
-                            err && err.readyInfo
-                                ? err.readyInfo
-                                : {
-                                      step: 'authenticated',
-                                      attempt: 1,
-                                      error: String(
-                                          (err && err.message) || err,
-                                      ),
-                                  };
-                        this._reportReady(Events.READY_FAILED, info);
-                    } finally {
-                        this._readyInFlight = false;
-                    }
+                    await this._onAppStateHasSynced(version);
                 },
             );
             let lastPercent = null;
@@ -408,7 +375,7 @@ class Client extends EventEmitter {
                 // Atomic hasSynced check in the same synchronous block as listener registration.
                 // If hasSynced is already true, Backbone won't fire change:hasSynced (no transition).
                 // If hasSynced is false, the listener above will catch the future transition.
-                const storeInjected = typeof window.WWebJS !== 'undefined';
+                const storeInjected = window.__wwebjsAttached === true;
                 if (Socket.hasSynced === true && !storeInjected) {
                     window.onAppStateHasSyncedEvent();
                 }
@@ -595,30 +562,96 @@ class Client extends EventEmitter {
     }
 
     /**
-     * Attach event listeners to WA Web
-     * Private function
-     * @property {boolean} reinject is this a reinject?
+     * Chamado pela página a cada mudança de Socket.hasSynced (um listener
+     * Backbone, sem await do lado da página). Antes, qualquer erro aqui morria
+     * dentro da página: sem log, sem nova tentativa, e o READY nunca chegava.
+     *
+     * Uma execução por vez: uma chamada que chega durante outra fica pendente
+     * e roda no fim (o Backbone só dispara em mudança de valor; descartar
+     * perderia o evento).
+     *
+     * @param {string} version versão do WA Web (para o cache local)
+     * @private
      */
+    async _onAppStateHasSynced(version) {
+        if (this._readyInFlight) {
+            this._readyPending = true;
+            return;
+        }
+        this._readyInFlight = true;
+        try {
+            const authEventPayload =
+                await this.authStrategy.getAuthEventPayload();
+            /**
+             * Emitted when authentication is successful
+             * @event Client#authenticated
+             */
+            this.emit(Events.AUTHENTICATED, authEventPayload);
+
+            await this._injectUtilsAndEmitReady(version);
+        } catch (err) {
+            const info =
+                err && err.readyInfo
+                    ? err.readyInfo
+                    : {
+                          step: 'authenticated',
+                          attempt: 1,
+                          attempts: 1,
+                          error: String((err && err.message) || err),
+                      };
+            this._reportReady(Events.READY_FAILED, info);
+        } finally {
+            this._readyInFlight = false;
+            if (this._readyPending) {
+                this._readyPending = false;
+                if (!this._pageGone()) {
+                    setTimeout(() => {
+                        this._onAppStateHasSynced(version).catch(() => {});
+                    }, 0);
+                }
+            }
+        }
+    }
+
     /**
      * Injeta os utilitários do wwebjs na página e emite READY, com novas
      * tentativas para os passos que podem ser repetidos com segurança.
      *
      * Medido em produção (nov/2026): de vez em quando o boot autentica e o
      * READY nunca chega, sem nenhum erro no log; a tentativa seguinte, num
-     * processo novo, sobe em segundos. Agora o passo que falhou é reportado
-     * (eventos `ready_retry` / `ready_failed` e console.warn) e repetido na
-     * mesma página antes de desistir.
+     * processo novo, sobe em segundos. Agora cada passo tem prazo, o passo
+     * que falhou é reportado (`ready_retry` / `ready_failed` + console.warn)
+     * e é repetido na mesma página antes de desistir.
      *
-     * `attachEventListeners` registra listeners na página sem limpeza, então
-     * roda no máximo uma vez: se falhar, não repete (desiste e reporta).
+     * - "Montado" = `window.__wwebjsAttached` (listeners ligados), não só
+     *   `window.WWebJS`: depois de uma falha, a página não é tratada como
+     *   pronta pela metade.
+     * - `attachEventListeners` registra listeners na página sem limpeza:
+     *   roda no máximo uma vez por documento (`__wwebjsAttachStarted`). Se
+     *   começou e não terminou, desiste em vez de religar.
+     * - Se a página recarregar no meio, a execução é abandonada: o
+     *   framenavigated → inject() cuida do documento novo.
      *
      * @param {string} version versão do WA Web (para o cache local)
+     * @returns {Promise<boolean>} true se emitiu READY, false se abandonou
      * @private
      */
     async _injectUtilsAndEmitReady(version) {
-        const attempts = Math.max(1, this.options.readyInjectAttempts || 4);
-        const delays = this.options.readyRetryDelaysMs || [2000, 5000, 10000];
-        let needsSetup = null;
+        const opt = this.options;
+        const attempts =
+            Number.isInteger(opt.readyInjectAttempts) &&
+            opt.readyInjectAttempts > 0
+                ? opt.readyInjectAttempts
+                : 4;
+        const delays =
+            Array.isArray(opt.readyRetryDelaysMs) &&
+            opt.readyRetryDelaysMs.length > 0
+                ? opt.readyRetryDelaysMs
+                : [2000, 5000, 10000];
+        const stepTimeout =
+            opt.readyStepTimeoutMs > 0 ? opt.readyStepTimeoutMs : 20000;
+
+        let docId = null;
         let persisted = false;
         let utilsLoaded = false;
         let infoLoaded = false;
@@ -626,60 +659,83 @@ class Client extends EventEmitter {
         for (let attempt = 1; ; attempt++) {
             let step = 'check_injected';
             try {
-                if (needsSetup === null) {
-                    needsSetup = !(await this.pupPage.evaluate(async () => {
-                        return typeof window.WWebJS !== 'undefined';
-                    }));
+                const state = await this._withStepTimeout(
+                    step,
+                    this.pupPage.evaluate(() => ({
+                        doc: performance.timeOrigin,
+                        attached: window.__wwebjsAttached === true,
+                        attachStarted: window.__wwebjsAttachStarted === true,
+                        utils: typeof window.WWebJS !== 'undefined',
+                    })),
+                    stepTimeout,
+                );
+                if (docId === null) {
+                    docId = state.doc;
+                } else if (state.doc !== docId) {
+                    console.warn(
+                        '[wwebjs] ready: a página recarregou no meio; o inject() da página nova assume',
+                    );
+                    return false;
                 }
 
-                if (needsSetup) {
+                if (!state.attached) {
+                    if (state.attachStarted) {
+                        step = 'attach_incomplete';
+                        const e = new Error(
+                            'listeners ligados pela metade neste documento',
+                        );
+                        e.readyFinal = true;
+                        throw e;
+                    }
+
                     if (
                         !persisted &&
-                        this.options.webVersionCache.type === 'local' &&
+                        opt.webVersionCache &&
+                        opt.webVersionCache.type === 'local' &&
                         this.currentIndexHtml
                     ) {
-                        step = 'persist_cache';
-                        const { type: webCacheType, ...webCacheOptions } =
-                            this.options.webVersionCache;
-                        const webCache = WebCacheFactory.createWebCache(
-                            webCacheType,
-                            webCacheOptions,
-                        );
-                        await webCache.persist(this.currentIndexHtml, version);
+                        // O cache é opcional: falha aqui (disco cheio,
+                        // permissão) não pode impedir o READY.
                         persisted = true;
+                        try {
+                            const { type: webCacheType, ...webCacheOptions } =
+                                opt.webVersionCache;
+                            const webCache = WebCacheFactory.createWebCache(
+                                webCacheType,
+                                webCacheOptions,
+                            );
+                            await webCache.persist(
+                                this.currentIndexHtml,
+                                version,
+                            );
+                        } catch (cacheErr) {
+                            console.warn(
+                                `[wwebjs] ready: falha ao gravar o cache da versão (segue sem): ${(cacheErr && cacheErr.message) || cacheErr}`,
+                            );
+                        }
                     }
 
-                    if (utilsLoaded && attempt > 1) {
-                        // A página pode ter recarregado entre as tentativas:
-                        // aí os utilitários sumiram e precisam voltar.
-                        step = 'check_injected';
-                        const still = await this.pupPage.evaluate(async () => {
-                            return typeof window.WWebJS !== 'undefined';
-                        });
-                        if (!still) utilsLoaded = false;
-                    }
-
-                    if (!utilsLoaded) {
+                    if (!utilsLoaded || !state.utils) {
                         // Load util functions (serializers, helper functions)
                         step = 'load_utils';
-                        await this.pupPage.evaluate(LoadUtils);
+                        await this._withStepTimeout(
+                            step,
+                            this.pupPage.evaluate(LoadUtils),
+                            stepTimeout,
+                        );
                         step = 'wait_utils';
                         await this.pupPage.waitForFunction(
                             'typeof window.WWebJS !== "undefined"',
-                            { timeout: 30000 },
+                            { timeout: stepTimeout },
                         );
                         utilsLoaded = true;
                     }
 
                     if (!infoLoaded) {
                         step = 'client_info';
-                        /**
-                         * Current connection information
-                         * @type {ClientInfo}
-                         */
-                        this.info = new ClientInfo(
-                            this,
-                            await this.pupPage.evaluate(() => {
+                        const rawInfo = await this._withStepTimeout(
+                            step,
+                            this.pupPage.evaluate(() => {
                                 return {
                                     ...window
                                         .require('WAWebConnModel')
@@ -693,25 +749,40 @@ class Client extends EventEmitter {
                                             .getMaybeMeLidUser(),
                                 };
                             }),
+                            stepTimeout,
                         );
+                        /**
+                         * Current connection information
+                         * @type {ClientInfo}
+                         */
+                        this.info = new ClientInfo(this, rawInfo);
                         this.interface = new InterfaceController(this);
                         infoLoaded = true;
                     }
 
-                    // Marca antes: se falhar, não roda de novo (sem limpeza
-                    // dos listeners na página, repetir duplicaria eventos).
+                    step = 'attach_mark';
+                    await this._withStepTimeout(
+                        step,
+                        this.pupPage.evaluate(() => {
+                            window.__wwebjsAttachStarted = true;
+                        }),
+                        stepTimeout,
+                    );
                     step = 'attach_listeners';
-                    needsSetup = false;
-                    await this.attachEventListeners();
+                    await this._withStepTimeout(
+                        step,
+                        this.attachEventListeners(),
+                        stepTimeout * 2,
+                    );
+                    await this._withStepTimeout(
+                        step,
+                        this.pupPage.evaluate(() => {
+                            window.__wwebjsAttached = true;
+                        }),
+                        stepTimeout,
+                    );
                 }
-
-                /**
-                 * Emitted when the client has initialized and is ready to receive messages.
-                 * @event Client#ready
-                 */
-                this.emit(Events.READY);
-                this.authStrategy.afterAuthReady();
-                return;
+                break;
             } catch (err) {
                 const info = {
                     step,
@@ -719,14 +790,11 @@ class Client extends EventEmitter {
                     attempts,
                     error: String((err && err.message) || err),
                 };
-                const pageGone =
-                    !this.pupPage ||
-                    (typeof this.pupPage.isClosed === 'function' &&
-                        this.pupPage.isClosed());
                 if (
+                    (err && err.readyFinal) ||
                     step === 'attach_listeners' ||
                     attempt >= attempts ||
-                    pageGone
+                    this._pageGone()
                 ) {
                     const final =
                         err instanceof Error ? err : new Error(info.error);
@@ -736,8 +804,65 @@ class Client extends EventEmitter {
                 this._reportReady(Events.READY_RETRY, info);
                 const delay = delays[Math.min(attempt - 1, delays.length - 1)];
                 await new Promise((resolve) => setTimeout(resolve, delay));
+                if (this._pageGone()) return false;
             }
         }
+
+        // Fora do loop: um listener de 'ready' que lance erro não pode virar
+        // nova tentativa nem ready_failed.
+        try {
+            /**
+             * Emitted when the client has initialized and is ready to receive messages.
+             * @event Client#ready
+             */
+            this.emit(Events.READY);
+        } catch (listenerErr) {
+            console.warn(
+                `[wwebjs] um listener de 'ready' lançou erro: ${(listenerErr && listenerErr.message) || listenerErr}`,
+            );
+        }
+        this.authStrategy.afterAuthReady();
+        return true;
+    }
+
+    /**
+     * Espera uma promise por no máximo `ms`; estoura com o nome do passo. A
+     * promise original fica com catch (pode rejeitar depois do prazo, no
+     * protocolTimeout do Puppeteer) para não virar unhandled rejection.
+     * @private
+     */
+    _withStepTimeout(step, promise, ms) {
+        const guarded = Promise.resolve(promise);
+        guarded.catch(() => {});
+        let timer;
+        const timeout = new Promise((_, reject) => {
+            timer = setTimeout(
+                () => reject(new Error(`passo ${step} passou de ${ms} ms`)),
+                ms,
+            );
+        });
+        return Promise.race([guarded, timeout]).finally(() =>
+            clearTimeout(timer),
+        );
+    }
+
+    /**
+     * Página fechada ou browser desconectado.
+     * @private
+     */
+    _pageGone() {
+        const page = this.pupPage;
+        if (!page) return true;
+        if (typeof page.isClosed === 'function' && page.isClosed()) return true;
+        const browser = this.pupBrowser;
+        if (
+            browser &&
+            typeof browser.isConnected === 'function' &&
+            !browser.isConnected()
+        ) {
+            return true;
+        }
+        return false;
     }
 
     /**
@@ -756,6 +881,11 @@ class Client extends EventEmitter {
         }
     }
 
+    /**
+     * Attach event listeners to WA Web
+     * Private function
+     * @property {boolean} reinject is this a reinject?
+     */
     async attachEventListeners() {
         await exposeFunctionIfAbsent(
             this.pupPage,
