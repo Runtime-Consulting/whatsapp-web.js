@@ -290,80 +290,40 @@ class Client extends EventEmitter {
                 this.pupPage,
                 'onAppStateHasSyncedEvent',
                 async () => {
-                    const authEventPayload =
-                        await this.authStrategy.getAuthEventPayload();
-                    /**
-                     * Emitted when authentication is successful
-                     * @event Client#authenticated
-                     */
-                    this.emit(Events.AUTHENTICATED, authEventPayload);
-
-                    const injected = await this.pupPage.evaluate(async () => {
-                        return typeof window.WWebJS !== 'undefined';
-                    });
-
-                    if (!injected) {
-                        if (
-                            this.options.webVersionCache.type === 'local' &&
-                            this.currentIndexHtml
-                        ) {
-                            const { type: webCacheType, ...webCacheOptions } =
-                                this.options.webVersionCache;
-                            const webCache = WebCacheFactory.createWebCache(
-                                webCacheType,
-                                webCacheOptions,
-                            );
-
-                            await webCache.persist(
-                                this.currentIndexHtml,
-                                version,
-                            );
-                        }
-
-                        // Load util functions (serializers, helper functions)
-                        await this.pupPage.evaluate(LoadUtils);
-
-                        await this.pupPage
-                            .waitForFunction(
-                                'typeof window.WWebJS !== "undefined"',
-                                { timeout: 30000 },
-                            )
-                            .catch(() => {
-                                throw 'ready timeout';
-                            });
-
+                    // Uma execução por vez: a página chama isto a cada mudança
+                    // de hasSynced, e duas em paralelo injetavam e emitiam
+                    // READY em dobro.
+                    if (this._readyInFlight) return;
+                    this._readyInFlight = true;
+                    try {
+                        const authEventPayload =
+                            await this.authStrategy.getAuthEventPayload();
                         /**
-                         * Current connection information
-                         * @type {ClientInfo}
+                         * Emitted when authentication is successful
+                         * @event Client#authenticated
                          */
-                        this.info = new ClientInfo(
-                            this,
-                            await this.pupPage.evaluate(() => {
-                                return {
-                                    ...window
-                                        .require('WAWebConnModel')
-                                        .Conn.serialize(),
-                                    wid:
-                                        window
-                                            .require('WAWebUserPrefsMeUser')
-                                            .getMaybeMePnUser() ||
-                                        window
-                                            .require('WAWebUserPrefsMeUser')
-                                            .getMaybeMeLidUser(),
-                                };
-                            }),
-                        );
+                        this.emit(Events.AUTHENTICATED, authEventPayload);
 
-                        this.interface = new InterfaceController(this);
-
-                        await this.attachEventListeners();
+                        await this._injectUtilsAndEmitReady(version);
+                    } catch (err) {
+                        // Antes, qualquer erro aqui morria dentro da página
+                        // (a função é chamada por um listener Backbone, sem
+                        // await): sem log, sem nova tentativa, e o READY
+                        // nunca chegava.
+                        const info =
+                            err && err.readyInfo
+                                ? err.readyInfo
+                                : {
+                                      step: 'authenticated',
+                                      attempt: 1,
+                                      error: String(
+                                          (err && err.message) || err,
+                                      ),
+                                  };
+                        this._reportReady(Events.READY_FAILED, info);
+                    } finally {
+                        this._readyInFlight = false;
                     }
-                    /**
-                     * Emitted when the client has initialized and is ready to receive messages.
-                     * @event Client#ready
-                     */
-                    this.emit(Events.READY);
-                    this.authStrategy.afterAuthReady();
                 },
             );
             let lastPercent = null;
@@ -639,6 +599,163 @@ class Client extends EventEmitter {
      * Private function
      * @property {boolean} reinject is this a reinject?
      */
+    /**
+     * Injeta os utilitários do wwebjs na página e emite READY, com novas
+     * tentativas para os passos que podem ser repetidos com segurança.
+     *
+     * Medido em produção (nov/2026): de vez em quando o boot autentica e o
+     * READY nunca chega, sem nenhum erro no log; a tentativa seguinte, num
+     * processo novo, sobe em segundos. Agora o passo que falhou é reportado
+     * (eventos `ready_retry` / `ready_failed` e console.warn) e repetido na
+     * mesma página antes de desistir.
+     *
+     * `attachEventListeners` registra listeners na página sem limpeza, então
+     * roda no máximo uma vez: se falhar, não repete (desiste e reporta).
+     *
+     * @param {string} version versão do WA Web (para o cache local)
+     * @private
+     */
+    async _injectUtilsAndEmitReady(version) {
+        const attempts = Math.max(1, this.options.readyInjectAttempts || 4);
+        const delays = this.options.readyRetryDelaysMs || [2000, 5000, 10000];
+        let needsSetup = null;
+        let persisted = false;
+        let utilsLoaded = false;
+        let infoLoaded = false;
+
+        for (let attempt = 1; ; attempt++) {
+            let step = 'check_injected';
+            try {
+                if (needsSetup === null) {
+                    needsSetup = !(await this.pupPage.evaluate(async () => {
+                        return typeof window.WWebJS !== 'undefined';
+                    }));
+                }
+
+                if (needsSetup) {
+                    if (
+                        !persisted &&
+                        this.options.webVersionCache.type === 'local' &&
+                        this.currentIndexHtml
+                    ) {
+                        step = 'persist_cache';
+                        const { type: webCacheType, ...webCacheOptions } =
+                            this.options.webVersionCache;
+                        const webCache = WebCacheFactory.createWebCache(
+                            webCacheType,
+                            webCacheOptions,
+                        );
+                        await webCache.persist(this.currentIndexHtml, version);
+                        persisted = true;
+                    }
+
+                    if (utilsLoaded && attempt > 1) {
+                        // A página pode ter recarregado entre as tentativas:
+                        // aí os utilitários sumiram e precisam voltar.
+                        step = 'check_injected';
+                        const still = await this.pupPage.evaluate(async () => {
+                            return typeof window.WWebJS !== 'undefined';
+                        });
+                        if (!still) utilsLoaded = false;
+                    }
+
+                    if (!utilsLoaded) {
+                        // Load util functions (serializers, helper functions)
+                        step = 'load_utils';
+                        await this.pupPage.evaluate(LoadUtils);
+                        step = 'wait_utils';
+                        await this.pupPage.waitForFunction(
+                            'typeof window.WWebJS !== "undefined"',
+                            { timeout: 30000 },
+                        );
+                        utilsLoaded = true;
+                    }
+
+                    if (!infoLoaded) {
+                        step = 'client_info';
+                        /**
+                         * Current connection information
+                         * @type {ClientInfo}
+                         */
+                        this.info = new ClientInfo(
+                            this,
+                            await this.pupPage.evaluate(() => {
+                                return {
+                                    ...window
+                                        .require('WAWebConnModel')
+                                        .Conn.serialize(),
+                                    wid:
+                                        window
+                                            .require('WAWebUserPrefsMeUser')
+                                            .getMaybeMePnUser() ||
+                                        window
+                                            .require('WAWebUserPrefsMeUser')
+                                            .getMaybeMeLidUser(),
+                                };
+                            }),
+                        );
+                        this.interface = new InterfaceController(this);
+                        infoLoaded = true;
+                    }
+
+                    // Marca antes: se falhar, não roda de novo (sem limpeza
+                    // dos listeners na página, repetir duplicaria eventos).
+                    step = 'attach_listeners';
+                    needsSetup = false;
+                    await this.attachEventListeners();
+                }
+
+                /**
+                 * Emitted when the client has initialized and is ready to receive messages.
+                 * @event Client#ready
+                 */
+                this.emit(Events.READY);
+                this.authStrategy.afterAuthReady();
+                return;
+            } catch (err) {
+                const info = {
+                    step,
+                    attempt,
+                    attempts,
+                    error: String((err && err.message) || err),
+                };
+                const pageGone =
+                    !this.pupPage ||
+                    (typeof this.pupPage.isClosed === 'function' &&
+                        this.pupPage.isClosed());
+                if (
+                    step === 'attach_listeners' ||
+                    attempt >= attempts ||
+                    pageGone
+                ) {
+                    const final =
+                        err instanceof Error ? err : new Error(info.error);
+                    final.readyInfo = info;
+                    throw final;
+                }
+                this._reportReady(Events.READY_RETRY, info);
+                const delay = delays[Math.min(attempt - 1, delays.length - 1)];
+                await new Promise((resolve) => setTimeout(resolve, delay));
+            }
+        }
+    }
+
+    /**
+     * Reporta problema no caminho até o READY: evento para quem usa a lib e
+     * console.warn para ficar no log do processo mesmo sem listener.
+     * @private
+     */
+    _reportReady(event, info) {
+        try {
+            console.warn(
+                `[wwebjs] ${event}: passo=${info.step} tentativa=${info.attempt}/${info.attempts || 1} erro=${info.error}`,
+            );
+            this.emit(event, info);
+        } catch (ignoredError) {
+            // reportar nunca pode derrubar o boot
+        }
+    }
+
     async attachEventListeners() {
         await exposeFunctionIfAbsent(
             this.pupPage,
